@@ -39,10 +39,20 @@ MQTTClient client = MQTTClient(256);
 WiFiUDP udpControl;
 const uint16_t UDP_PORT = 4210;
 
+// タイミング定数
+const unsigned long WAITING_TIMEOUT = 15000; // 15秒
+const unsigned long WIFI_CHECK_INTERVAL = 30000; // 30秒
+const unsigned long MQTT_CHECK_INTERVAL = 30000; // 30秒
+const unsigned long NFC_CONNECTION_CHECK_INTERVAL = 10000; // 10秒
+const unsigned long NFC_CHECK_INTERVAL = 150; // 150ms
+const unsigned long DISPLAY_UPDATE_INTERVAL = 100; // 100ms
+const unsigned long DOOR_DEBOUNCE_TIME = 2000; // 2秒
+const unsigned long WIFI_RECONNECT_TIMEOUT = 10000; // 10秒
+const unsigned long MAX_ERROR_COUNT = 5; // 連続エラー上限
+
 // システム状態管理
 SystemMode currentMode = NORMAL;
 unsigned long modeStartTime = 0;
-const unsigned long WAITING_TIMEOUT = 15000; // 15秒
 
 // ドア状態検知
 enum DoorState { DOOR_OPEN, DOOR_CLOSE };
@@ -55,6 +65,14 @@ bool hasSeenOpenInWaitingMode = false;
 String lastNfcCardID = "";
 CardType lastNfcCardType = CARD_NONE;
 unsigned long lastNfcCheckTime = 0;
+
+// エラーカウント
+unsigned int wifiErrorCount = 0;
+unsigned int nfcErrorCount = 0;
+
+// マルチタスク管理
+TaskHandle_t wifiTaskHandle = NULL;
+volatile bool isWifiReconnecting = false;
 
 // ログをAWS IoT Coreに送信
 void publishLog(const String& msg) {
@@ -110,32 +128,59 @@ void onMqttMessage(String &topic, String &payload) {
   handleCommand(payload);
 }
 
-// WiFi再接続
-void ensureWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Reconnecting...");
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    
-    unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
-      delay(500);
+// WiFi/MQTT管理タスク（Core 0で並列実行）
+void wifiMaintainTask(void* parameter) {
+  while (true) {
+    // WiFi接続チェック
+    if (WiFi.status() != WL_CONNECTED) {
+      isWifiReconnecting = true;
+      Serial.println("[WiFi] Reconnecting...");
+      
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      
+      unsigned long startAttempt = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_RECONNECT_TIMEOUT) {
+        delay(500);
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[WiFi] Reconnected");
+        
+        // UDP再初期化
+        udpControl.stop();
+        udpControl.begin(UDP_PORT);
+        Serial.println("[UDP] Restarted");
+        
+        publishLog("WiFi reconnected");
+        wifiErrorCount = 0;
+      } else {
+        Serial.println("[WiFi] Reconnection failed");
+        wifiErrorCount++;
+        
+        // 連続エラーが多い場合は再起動
+        if (wifiErrorCount >= MAX_ERROR_COUNT) {
+          Serial.println("[WiFi] Too many errors, restarting...");
+          delay(2000);
+          ESP.restart();
+        }
+      }
+      
+      isWifiReconnecting = false;
+    } else {
+      wifiErrorCount = 0;
+      
+      // MQTT接続チェック
+      if (!client.connected()) {
+        if (client.connect(THINGNAME)) {
+          client.subscribe(topicSub);
+          publishLog("Connected to AWS IoT");
+        }
+      }
     }
     
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("[WiFi] Reconnected");
-      publishLog("WiFi reconnected");
-    }
-  }
-}
-
-// MQTT再接続
-void ensureMqtt() {
-  if (!client.connected()) {
-    if (client.connect(THINGNAME)) {
-      client.subscribe(topicSub);
-      publishLog("Connected to AWS IoT");
-    }
+    // 30秒待機
+    vTaskDelay(WIFI_CHECK_INTERVAL / portTICK_PERIOD_MS);
   }
 }
 
@@ -167,16 +212,32 @@ bool isCardAllowed(const String& cardID) {
 // NFC処理（ポーリング間隔を設けて高速化）
 void processNfc() {
   static unsigned long lastNfcCheck = 0;
-  const unsigned long NFC_CHECK_INTERVAL = 150; // 150msごとにチェック
   
   if (millis() - lastNfcCheck < NFC_CHECK_INTERVAL) {
     return;
   }
   lastNfcCheck = millis();
   
-  if (nfcReader.getStatus() != NFC_OK) {
+  NFCStatus nfcStatus = nfcReader.getStatus();
+  if (nfcStatus == NFC_ERROR) {
+    nfcErrorCount++;
+    
+    // 連続エラーが多い場合は再起動
+    if (nfcErrorCount >= MAX_ERROR_COUNT) {
+      Serial.println("[NFC] Too many errors, restarting...");
+      M5.Display.clear();
+      M5.Display.setTextColor(RED);
+      M5.Display.println("NFC ERROR");
+      M5.Display.println("Restarting...");
+      delay(2000);
+      ESP.restart();
+    }
+    return;
+  } else if (nfcStatus != NFC_OK) {
     return;
   }
+  
+  nfcErrorCount = 0; // 正常時はリセット
   
   CardType cardType = nfcReader.checkCard();
   if (cardType != CARD_NONE) {
@@ -255,8 +316,24 @@ void setup() {
   wifi_s.setPrivateKey(AWS_CERT_PRIVATE);
   client.begin(AWS_IOT_ENDPOINT, AWS_PORT, wifi_s);
   client.onMessage(onMqttMessage);
-  ensureMqtt();
+  
+  // 初回MQTT接続
+  if (client.connect(THINGNAME)) {
+    client.subscribe(topicSub);
+    publishLog("Connected to AWS IoT");
+  }
 
+  // WiFi/MQTT管理タスクをCore 0で起動
+  xTaskCreatePinnedToCore(
+    wifiMaintainTask,   // タスク関数
+    "WiFiMaintain",     // タスク名
+    8192,               // スタックサイズ
+    NULL,               // パラメータ
+    1,                  // 優先度
+    &wifiTaskHandle,    // タスクハンドル
+    0                   // Core 0で実行
+  );
+  
   M5.Display.clear();
   M5.Display.println("Ready!");
   delay(1000);
@@ -268,6 +345,14 @@ void updateDisplay() {
   M5.Display.clear();
   M5.Display.setCursor(0, 5);
   M5.Display.setTextSize(2);
+
+  // WiFi再接続中の表示（最優先）
+  if (isWifiReconnecting) {
+    M5.Display.setTextColor(YELLOW);
+    M5.Display.println("WiFi");
+    M5.Display.println("Reconnecting...");
+    return;
+  }
 
   // モード表示
   if (currentMode == NORMAL) {
@@ -318,22 +403,14 @@ void updateDisplay() {
 void loop() {
   M5.update();
 
-  // WiFi/MQTT接続維持
-  static unsigned long lastConnectionCheck = 0;
-  if (millis() - lastConnectionCheck > 5000) {
-    ensureWiFi();
-    ensureMqtt();
-    lastConnectionCheck = millis();
-  }
-
   // NFC接続維持
   static unsigned long lastNfcConnectionCheck = 0;
-  if (millis() - lastNfcConnectionCheck > 10000) {
+  if (millis() - lastNfcConnectionCheck > NFC_CONNECTION_CHECK_INTERVAL) {
     nfcReader.ensureConnection();
     lastNfcConnectionCheck = millis();
   }
 
-  // UDP受信
+  // UDP受信とMQTTメッセージ処理
   processUdp();
   client.loop();
   
@@ -359,11 +436,11 @@ void loop() {
 
   bool isCurrentlyClose = (measure.RangeStatus != 4 && measure.RangeMilliMeter < 40);
 
-  // ドア状態判定（2秒のデバウンス）
+  // ドア状態判定（デバウンス）
   if (isCurrentlyClose) {
     if (doorCloseStartTime == 0) {
       doorCloseStartTime = millis();
-    } else if (millis() - doorCloseStartTime >= 2000) {
+    } else if (millis() - doorCloseStartTime >= DOOR_DEBOUNCE_TIME) {
       lastDoorState = doorState;
       doorState = DOOR_CLOSE;
     }
@@ -397,7 +474,7 @@ void loop() {
 
   // ディスプレイ更新（高速化のため頻度を下げる）
   static unsigned long lastDisplayUpdate = 0;
-  if (millis() - lastDisplayUpdate >= 100) {
+  if (millis() - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
     updateDisplay();
     lastDisplayUpdate = millis();
   }
