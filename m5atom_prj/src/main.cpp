@@ -7,6 +7,7 @@
 #include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <MQTTClient.h>
+#include <HTTPClient.h>
 #include "secrets.h"
 #include "nfc.h"
 
@@ -14,6 +15,15 @@
 enum SystemMode {
   NORMAL,          // 通常状態
   WAITING_MODE     // ドア開閉待機モード
+};
+
+// アクセス経路の種類
+enum AccessSource {
+  ACCESS_NFC,      // NFC経由
+  ACCESS_UDP,      // UDP経由
+  ACCESS_AWS,      // AWS IoT経由
+  ACCESS_AUTO,     // 自動（待機モード後の自動閉鎖）
+  ACCESS_SENSOR    // センサー検知
 };
 
 // センサー
@@ -38,6 +48,7 @@ WiFiClientSecure wifi_s;
 MQTTClient client = MQTTClient(256);
 WiFiUDP udpControl;
 const uint16_t UDP_PORT = 4210;
+HTTPClient http;
 
 // タイミング定数
 const unsigned long WAITING_TIMEOUT = 15000; // 15秒
@@ -81,43 +92,118 @@ void publishLog(const String& msg) {
   client.publish(topicPub, msg.c_str());
 }
 
+// Pushover通知を送信
+void sendPushoverNotification(String message) {
+  // WiFi接続チェック
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Pushover] WiFi not connected, skipping notification");
+    return;
+  }
+  Serial.println("[Pushover] Sending notification...");
+  http.begin("https://api.pushover.net/1/messages.json");
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  String postData = "token=" + String(PUSHOVER_API_TOKEN) +
+                    "&user=" + String(PUSHOVER_USER_KEY) +
+                    "&message=" + message +
+                    "&title=スマートロック";
+  int httpCode = http.POST(postData);
+  if (httpCode > 0) {
+    Serial.printf("[Pushover] POST code: %d\n", httpCode);
+    if (httpCode == 200) {
+      Serial.println("[Pushover] Notification sent successfully");
+    } else {
+      Serial.println("[Pushover] Notification failed");
+    }
+  } else {
+    Serial.printf("[Pushover] POST failed, error: %s\n", http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+}
+
 
 // サーボでドアを開ける
-void openDoor() {
+void openDoor(AccessSource source = ACCESS_AWS, const String& cardName = "") {
   myServo.write(90);
   delay(MOVE_DELAY);
   myServo.write(155);
   delay(MOVE_DELAY);
   myServo.write(90);
   delay(MOVE_DELAY);
-  publishLog("Door opened");
+  
+  String logMsg = "Door opened";
+  String notificationMsg = "ロックを解除しました";
+  
+  // アクセス経路に応じてメッセージを変更
+  switch (source) {
+    case ACCESS_NFC:
+      logMsg += " via NFC: " + cardName;
+      notificationMsg += "\n経路: NFC (" + cardName + ")";
+      break;
+    case ACCESS_UDP:
+      logMsg += " via UDP";
+      notificationMsg += "\n経路: UDP";
+      break;
+    case ACCESS_AWS:
+      logMsg += " via AWS IoT";
+      notificationMsg += "\n経路: AWS IoT";
+      break;
+    default:
+      break;
+  }
+  
+  publishLog(logMsg);
+  sendPushoverNotification(notificationMsg);
 }
 
 // サーボでドアを閉める
-void closeDoor() {
+void closeDoor(AccessSource source = ACCESS_AWS, const String& cardName = "") {
   myServo.write(90);
   delay(MOVE_DELAY);
   myServo.write(15);
   delay(MOVE_DELAY);
   myServo.write(90);
   delay(MOVE_DELAY);
-  publishLog("Door closed");
+  
+  String logMsg = "Door closed";
+  String notificationMsg = "ロックをかけました";
+  
+  // アクセス経路に応じてメッセージを変更
+  switch (source) {
+    case ACCESS_AUTO:
+      logMsg += " (auto)";
+      notificationMsg += "\n経路: 自動";
+      break;
+    case ACCESS_UDP:
+      logMsg += " via UDP";
+      notificationMsg += "\n経路: UDP";
+      break;
+    case ACCESS_AWS:
+      logMsg += " via AWS IoT";
+      notificationMsg += "\n経路: AWS IoT";
+      break;
+    default:
+      break;
+  }
+  
+  publishLog(logMsg);
+  sendPushoverNotification(notificationMsg);
 }
 
 // コマンド処理
-void handleCommand(const String& payload) {
+void handleCommand(const String& payload, AccessSource source) {
   String cmd = payload;
   cmd.trim();
   
   if (cmd == "openlock") {
-    openDoor();
+    openDoor(source);
     currentMode = WAITING_MODE;
     modeStartTime = millis();
     hasSeenOpenInWaitingMode = false;
     publishLog("Command: openlock, switched to WAITING_MODE");
   } 
   else if (cmd == "closelock") {
-    closeDoor();
+    closeDoor(source);
     publishLog("Command: closelock");
   }
 }
@@ -125,7 +211,7 @@ void handleCommand(const String& payload) {
 // MQTT受信コールバック
 void onMqttMessage(String &topic, String &payload) {
   Serial.printf("[MQTT] Topic: %s, Payload: %s\n", topic.c_str(), payload.c_str());
-  handleCommand(payload);
+  handleCommand(payload, ACCESS_AWS);
 }
 
 // WiFi/MQTT管理タスク（Core 0で並列実行）
@@ -194,7 +280,7 @@ void processUdp() {
       buffer[len] = '\0';
       String payload(buffer);
       Serial.println("[UDP] " + payload);
-      handleCommand(payload);
+      handleCommand(payload, ACCESS_UDP);
     }
   }
 }
@@ -207,6 +293,16 @@ bool isCardAllowed(const String& cardID) {
     }
   }
   return false;
+}
+
+// カードIDから名前を取得
+String getCardName(const String& cardID) {
+  for (int i = 0; i < ALLOWED_CARD_COUNT; i++) {
+    if (cardID == ALLOWED_CARD_IDS[i]) {
+      return String(ALLOWED_CARD_NAMES[i]);
+    }
+  }
+  return "不明なカード";
 }
 
 // NFC処理（ポーリング間隔を設けて高速化）
@@ -247,8 +343,9 @@ void processNfc() {
     
     // カードID照合
     if (isCardAllowed(cardID)) {
+      String cardName = getCardName(cardID);
       publishLog("Card accepted: " + String(NFCReader::cardTypeToString(cardType)) + " ID=" + cardID);
-      openDoor();
+      openDoor(ACCESS_NFC, cardName);
       currentMode = WAITING_MODE;
       modeStartTime = millis();
       hasSeenOpenInWaitingMode = false;
@@ -462,10 +559,11 @@ void loop() {
     if (doorState == DOOR_OPEN && lastDoorState == DOOR_CLOSE) {
       hasSeenOpenInWaitingMode = true;
       publishLog("Detected CLOSE->OPEN in WAITING_MODE");
+      sendPushoverNotification("玄関ドアが開きました");
     }
 
     if (doorState == DOOR_CLOSE && lastDoorState == DOOR_OPEN && hasSeenOpenInWaitingMode) {
-      closeDoor();
+      closeDoor(ACCESS_AUTO);
       currentMode = NORMAL;
       hasSeenOpenInWaitingMode = false;
       publishLog("Auto-closed door after CLOSE->OPEN->CLOSE");

@@ -35,3 +35,10 @@ const char* ALLOWED_CARD_IDS[] = {
     "0123456789ABCDEF"
 };
 const int ALLOWED_CARD_COUNT = sizeof(ALLOWED_CARD_IDS) / sizeof(ALLOWED_CARD_IDS[0]);
+const char* ALLOWED_CARD_NAMES[] = {
+    "カード1"
+};
+
+// --- Pushover Settings ---
+const char* PUSHOVER_API_TOKEN = "";
+const char* PUSHOVER_USER_KEY = "";
